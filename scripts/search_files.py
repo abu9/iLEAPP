@@ -41,6 +41,10 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from scripts.ilapfuncs import get_plist_file_content, get_plist_content, logfunc, \
     is_platform_windows, open_sqlite_db_readonly, sanitize_file_path
 
+# Streaming decryption parameters
+DECRYPT_CHUNK_SIZE = 4 * 1024 * 1024          # 4 MiB
+LARGE_FILE_STREAM_THRESHOLD = 100 * 1024 * 1024  # 100 MiB
+
 normcase = lru_cache(maxsize=None)(os.path.normcase)
 domains = {
     "AppDomain-": "private/var/mobile/Containers/Data/Application",
@@ -588,18 +592,66 @@ class FileSeekerItunes(FileSeekerBase):
                         tmp_file_unwrapped_key = crypt.aes_key_unwrap(tmp_protection_class['Unwrapped'],
                                                                       tmp_file_wrapped_key)
 
-                        # Open the file and snag the contents
-                        with open(original_location, "rb") as temp_original_file:
-                            # Decrypt the contents, Apple uses a 0'd out 16-byte IV
+                        expected_size = tmp_file_meta.get('Size')
+
+                        # For large files, use streaming decryption + streaming write
+                        if expected_size is not None and expected_size > LARGE_FILE_STREAM_THRESHOLD:
                             cipher = Cipher(
                                 algorithms.AES(tmp_file_unwrapped_key),
-                                modes.CBC(b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'))
+                                modes.CBC(b'\x00' * 16)
+                            )
                             decryptor = cipher.decryptor()
-                            decrypted_contents = decryptor.update(temp_original_file.read()) + decryptor.finalize()
 
-                            # Write the decrypt into the expected located, only write the expected size, no padding
-                            with open(data_path, "wb") as temp_new_file:
-                                temp_new_file.write(decrypted_contents[0:tmp_file_meta['Size']])
+                            with open(original_location, "rb") as temp_original_file, \
+                                    open(data_path, "wb") as temp_new_file:
+                                remaining = expected_size
+                                while True:
+                                    chunk = temp_original_file.read(DECRYPT_CHUNK_SIZE)
+                                    if not chunk:
+                                        break
+                                    decrypted_chunk = decryptor.update(chunk)
+
+                                    if expected_size is None:
+                                        if decrypted_chunk:
+                                            temp_new_file.write(decrypted_chunk)
+                                        continue
+
+                                    if remaining <= 0:
+                                        continue
+
+                                    if len(decrypted_chunk) > remaining:
+                                        temp_new_file.write(decrypted_chunk[:remaining])
+                                        remaining = 0
+                                    else:
+                                        temp_new_file.write(decrypted_chunk)
+                                        remaining -= len(decrypted_chunk)
+
+                                tail = decryptor.finalize()
+                                if expected_size is None:
+                                    if tail:
+                                        temp_new_file.write(tail)
+                                elif remaining > 0 and tail:
+                                    if len(tail) > remaining:
+                                        temp_new_file.write(tail[:remaining])
+                                    else:
+                                        temp_new_file.write(tail)
+                        else:
+                            # For small/normal files, keep simple one-shot decryption
+                            with open(original_location, "rb") as temp_original_file:
+                                cipher = Cipher(
+                                    algorithms.AES(tmp_file_unwrapped_key),
+                                    modes.CBC(b'\x00' * 16)
+                                )
+                                decryptor = cipher.decryptor()
+                                decrypted_contents = (
+                                    decryptor.update(temp_original_file.read()) +
+                                    decryptor.finalize()
+                                )
+                                with open(data_path, "wb") as temp_new_file:
+                                    if expected_size is None:
+                                        temp_new_file.write(decrypted_contents)
+                                    else:
+                                        temp_new_file.write(decrypted_contents[0:expected_size])
 
                     # If not encrypted, just copy the thing
                     else:
