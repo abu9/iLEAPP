@@ -1,4 +1,4 @@
-# Parts of this script have been modified from code 
+# Parts of this script have been modified from code  
 # found in Yogesh Khatri's mac_apt project Notes plugin (https://github.com/ydkhatri/mac_apt) 
 # and used under terms of the MIT License.
 
@@ -14,15 +14,20 @@ from scripts.ilapfuncs import logfunc, tsv, timeline, open_sqlite_db_readonly, d
 
 def get_notes(files_found, report_folder, seeker, wrap_text, timezone_offset):
     data_list = []
+    all_rows = []
+    analyzed_file = ''
+
     for file_found in files_found:
         file_found = str(file_found)
 
         if file_found.endswith('.sqlite'):
             db = open_sqlite_db_readonly(file_found)
             cursor = db.cursor()
-            
-            if does_column_exist_in_db(file_found, 'ZICCLOUDSYNCINGOBJECT','ZACCOUNT4') == True and does_column_exist_in_db(file_found, 'ZICCLOUDSYNCINGOBJECT','ZCREATIONDATE3') == True:
-                        
+            analyzed_file = file_found
+
+            if does_column_exist_in_db(file_found, 'ZICCLOUDSYNCINGOBJECT', 'ZACCOUNT4') and \
+               does_column_exist_in_db(file_found, 'ZICCLOUDSYNCINGOBJECT', 'ZCREATIONDATE3'):
+
                 cursor.execute('''
                     SELECT 
                     DATETIME(TabA.ZCREATIONDATE3+978307200,'UNIXEPOCH'), 
@@ -59,7 +64,9 @@ def get_notes(files_found, report_folder, seeker, wrap_text, timezone_offset):
                     LEFT JOIN ZICNOTEDATA TabF on TabF.ZNOTE = TabA.Z_PK
                     ''')
 
-            elif does_column_exist_in_db(file_found, 'ZICCLOUDSYNCINGOBJECT','ZACCOUNT4') == True and does_column_exist_in_db(file_found, 'ZICCLOUDSYNCINGOBJECT','ZCREATIONDATE3') == False:
+            elif does_column_exist_in_db(file_found, 'ZICCLOUDSYNCINGOBJECT', 'ZACCOUNT4') and \
+                 not does_column_exist_in_db(file_found, 'ZICCLOUDSYNCINGOBJECT', 'ZCREATIONDATE3'):
+
                 cursor.execute('''
                     SELECT 
                     DATETIME(TabA.ZCREATIONDATE1+978307200,'UNIXEPOCH'), 
@@ -132,26 +139,45 @@ def get_notes(files_found, report_folder, seeker, wrap_text, timezone_offset):
                     LEFT JOIN ZICCLOUDSYNCINGOBJECT TabE on TabD.Z_PK = TabE.ZATTACHMENT1
                     LEFT JOIN ZICNOTEDATA TabF on TabF.ZNOTE = TabA.Z_PK
                     ''')
-            
+
             all_rows = cursor.fetchall()
-            analyzed_file = file_found
+            db.close()
 
     if len(all_rows) > 0:
         for row in all_rows:
-            
+
+            # 非加密且有正文数据时，解析 Note 内容
             if row[6] == 'No' and row[16] is not None:
                 data = GetUncompressedData(row[16])
                 text_content = ProcessNoteBodyBlob(data)
             else:
                 text_content = ''
-            
-            if row[10] is not None and row[11] is not None:
-                attachment_file = join(dirname(analyzed_file), 'Accounts/LocalAccount/Media', row[11], row[10])
+
+            # 附件处理：避免长路径 + 非图片类型导致的 OSError
+            if row[10] is not None and row[11] is not None and analyzed_file:
+                # 用纯组件 join，避免 'Accounts/LocalAccount/Media' 里的斜杠破坏 \\?\ 路径
+                attachment_file = join(
+                    dirname(analyzed_file),
+                    'Accounts',
+                    'LocalAccount',
+                    'Media',
+                    row[11],
+                    row[10]
+                )
                 attachment_storage_path = dirname(attachment_file)
-                if imghdr.what(attachment_file) == 'jpeg' or imghdr.what(attachment_file) == 'jpg' or imghdr.what(attachment_file) == 'png':
-                    thumbnail_path = join(report_folder, 'thumbnail_'+row[10])
-                    save_original_attachment_as_thumbnail(attachment_file, thumbnail_path)
-                    thumbnail = '<img src="{}">'.format(thumbnail_path)
+
+                try:
+                    img_type = imghdr.what(attachment_file)
+                except OSError:
+                    img_type = None
+
+                if img_type in ('jpeg', 'jpg', 'png'):
+                    thumbnail_path = join(report_folder, 'thumbnail_' + row[10])
+                    try:
+                        save_original_attachment_as_thumbnail(attachment_file, thumbnail_path)
+                        thumbnail = '<img src="{}">'.format(thumbnail_path)
+                    except OSError:
+                        thumbnail = 'Error opening attachment file as image.'
                 else:
                     thumbnail = 'File is not an image or the filetype is not supported yet.'
             else:
@@ -163,16 +189,42 @@ def get_notes(files_found, report_folder, seeker, wrap_text, timezone_offset):
             else:
                 filesize = ''
 
-            data_list.append((row[0], row[1], row[2], text_content, row[3], row[4], row[5], row[6], row[7], row[8], row[9], thumbnail, row[10], attachment_storage_path, filesize, row[13], row[14], row[15]))
+            data_list.append((
+                row[0],  # Creation Date
+                row[1],  # Note Title
+                row[2],  # Snippet
+                text_content,
+                row[3],  # Folder
+                row[4],  # Storage Place
+                row[5],  # Last Modified
+                row[6],  # Password Protected
+                row[7],  # Password Hint
+                row[8],  # Marked for Deletion
+                row[9],  # Pinned
+                thumbnail,
+                row[10],  # Attachment Original Filename
+                attachment_storage_path,
+                filesize,
+                row[13],  # Attachment Type
+                row[14],  # Attachment Creation Date
+                row[15]   # Attachment Last Modified
+            ))
 
         report = ArtifactHtmlReport('Notes')
         report.start_artifact_report(report_folder, 'Notes')
         report.add_script()
-        data_headers = ('Creation Date', 'Note Title', 'Snippet', 'Note Contents', 'Folder', 'Storage Place', 'Last Modified',
-                        'Password Protected', 'Password Hint', 'Marked for Deletion', 'Pinned', 'Attachment Thumbnail',
-                        'Attachment Original Filename', 'Attachment Storage Folder', 'Attachment Size in KB',
-                        'Attachment Type', 'Attachment Creation Date', 'Attachment Last Modified')
-        report.write_artifact_data_table(data_headers, data_list, analyzed_file, html_no_escape=['Attachment Thumbnail'])
+        data_headers = (
+            'Creation Date', 'Note Title', 'Snippet', 'Note Contents', 'Folder',
+            'Storage Place', 'Last Modified', 'Password Protected', 'Password Hint',
+            'Marked for Deletion', 'Pinned', 'Attachment Thumbnail',
+            'Attachment Original Filename', 'Attachment Storage Folder',
+            'Attachment Size in KB', 'Attachment Type',
+            'Attachment Creation Date', 'Attachment Last Modified'
+        )
+        report.write_artifact_data_table(
+            data_headers, data_list, analyzed_file,
+            html_no_escape=['Attachment Thumbnail']
+        )
         report.end_artifact_report()
 
         tsvname = 'Notes'
@@ -183,10 +235,9 @@ def get_notes(files_found, report_folder, seeker, wrap_text, timezone_offset):
     else:
         logfunc('No Notes available')
 
-    db.close()
 
 def GetUncompressedData(compressed):
-    if compressed == None:
+    if compressed is None:
         return None
     data = None
     try:
@@ -195,21 +246,23 @@ def GetUncompressedData(compressed):
         print('Zlib Decompression failed!')
     return data
 
+
 def ProcessNoteBodyBlob(blob):
     data = b''
-    if blob == None: return data
+    if blob is None:
+        return data
     try:
         pos = 0
-        if blob[0:3] != b'\x08\x00\x12': # header
+        if blob[0:3] != b'\x08\x00\x12':  # header
             print('Unexpected bytes in header pos 0 - ' + binascii.hexlify(blob[0:3]) + '  Expected 080012')
             return ''
         pos += 3
         length, skip = ReadLengthField(blob[pos:])
         pos += skip
 
-        if blob[pos:pos+3] != b'\x08\x00\x10': # header 2
+        if blob[pos:pos+3] != b'\x08\x00\x10':  # header 2
             print('Unexpected bytes in header pos {0}:{0}+3'.format(pos))
-            return '' 
+            return ''
         pos += 3
         length, skip = ReadLengthField(blob[pos:])
         pos += skip
@@ -228,11 +281,12 @@ def ProcessNoteBodyBlob(blob):
         pos += 1
         length, skip = ReadLengthField(blob[pos:])
         pos += skip
-        data = blob[pos : pos + length].decode('utf-8', 'backslashreplace')
+        data = blob[pos: pos + length].decode('utf-8', 'backslashreplace')
         # Skipping the formatting Tags
     except (IndexError, ValueError):
         print('Error processing note data blob')
     return data
+
 
 def ReadLengthField(blob):
     '''Returns a tuple (length, skip) where skip is number of bytes read'''
@@ -256,6 +310,7 @@ def save_original_attachment_as_thumbnail(file, store_path):
     thumbnail_max_size = (350, 350)
     image.thumbnail(thumbnail_max_size)
     image.save(store_path)
+
 
 __artifacts__ = {
     "notes": (
