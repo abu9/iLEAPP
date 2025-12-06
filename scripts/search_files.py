@@ -161,10 +161,12 @@ def decrypt_itunes_backup(directory, passcode):
             - "Incorrect password": Passcode was incorrect, could not unwrap protection class keys
             - "Could not find protection class for Manifest.db": Missing required protection class
     Notes:
-        - The function uses PBKDF2 key derivation with the passcode and keybag salt/iterations
-        - Protection class keys are unwrapped using AES key unwrapping
-        - The manifest key class identifies which protection class is used for Manifest.db
-        - Logs decryption status and errors using logfunc()
+        - The function uses PBKDF2 key derivation with the passcode and keybag salt/iterations.
+        - For iOS < 10.2–style backups that do not carry DPSL/DPIC, we fall back to the
+          single-stage derivation (password + SALT/ITER) in line with common tooling.
+        - Protection class keys are unwrapped using AES key unwrapping.
+        - The manifest key class identifies which protection class is used for Manifest.db.
+        - Logs decryption status and errors using logfunc().
     """
     protection_classes = {}
     manifest_key_class = None
@@ -179,9 +181,9 @@ def decrypt_itunes_backup(directory, passcode):
     # Initialize some values
     tmp_backup_keybag_index = 0
     tmp_protection_class = {}
-    tmp_salt = ''
+    tmp_salt = b""
     tmp_iter = 0
-    tmp_double_protection_salt = ''
+    tmp_double_protection_salt = b""
     tmp_double_protection_iter = 0
     keybag_uuid = None
 
@@ -231,15 +233,51 @@ def decrypt_itunes_backup(directory, passcode):
     # Clean up the open protection class
     protection_classes[tmp_protection_class['CLAS']] = tmp_protection_class
 
-    # Decrypt the Manifest password
+    # Decrypt the Manifest password / derive backup key
     try:
-        initial_unwrapped_key = hashlib.pbkdf2_hmac(
-            'sha256', str.encode(passcode), tmp_double_protection_salt,
-            tmp_double_protection_iter)
-        unwrapped_key = hashlib.pbkdf2_hmac('sha1', initial_unwrapped_key,
-                                            tmp_salt, tmp_iter, dklen=32)
+        if passcode is None:
+            raise TypeError("No passcode")
+
+        pass_bytes = str.encode(passcode)
+
+        # Decide whether to use the "double protection" stage (DPSL/DPIC) or not.
+        # Older backup formats (iOS < 10.2) derive directly from password + SALT/ITER.
+        use_double_stage = bool(tmp_double_protection_salt and tmp_double_protection_iter)
+
+        product_version = manifest.get('Lockdown', {}).get('ProductVersion')
+        if product_version:
+            try:
+                parts = [int(p) for p in str(product_version).split(".")]
+                major = parts[0] if len(parts) > 0 else 0
+                minor = parts[1] if len(parts) > 1 else 0
+                # If clearly older than 10.2, ignore DPSL/DPIC even if present/mis-set
+                if major < 10 or (major == 10 and minor < 2):
+                    use_double_stage = False
+            except (TypeError, ValueError):
+                # If version parsing fails, keep whatever we deduced from the keybag itself
+                pass
+
+        if use_double_stage:
+            temp = hashlib.pbkdf2_hmac(
+                'sha256',
+                pass_bytes,
+                tmp_double_protection_salt,
+                tmp_double_protection_iter,
+            )
+        else:
+            # Legacy path: derive directly from the cleartext passcode
+            temp = pass_bytes
+
+        unwrapped_key = hashlib.pbkdf2_hmac(
+            'sha1',
+            temp,
+            tmp_salt,
+            tmp_iter,
+            dklen=32,
+        )
     except TypeError:
         return None, "No password provided"
+
     # Unwrap all of the protection class keys
     for _, protection_class_value in protection_classes.items():
         protection_class = protection_class_value
@@ -659,6 +697,15 @@ class FileSeekerItunes(FileSeekerBase):
 
                     file_info = FileInfo(original_location, creation_date, modification_date)
                     self.file_infos[data_path] = file_info
+
+                    # Try to restore file mtime from Manifest metadata where available
+                    try:
+                        if modification_date and os.path.exists(data_path):
+                            mtime = float(modification_date)
+                            os.utime(data_path, (mtime, mtime))
+                    except (OSError, ValueError) as ex:
+                        logfunc(f'Could not set mtime for {data_path} ' + str(ex))
+
                     self.copied[original_location] = data_path
                 except OSError as ex:
                     logfunc(f'Could not copy {original_location} to {data_path} ' + str(ex))
