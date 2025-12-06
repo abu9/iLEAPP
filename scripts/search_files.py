@@ -41,7 +41,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from scripts.ilapfuncs import get_plist_file_content, get_plist_content, logfunc, \
     is_platform_windows, open_sqlite_db_readonly, sanitize_file_path
 
-# Streaming decryption parameters
+# Streaming decryption parameters (keep diff as small as possible)
 DECRYPT_CHUNK_SIZE = 4 * 1024 * 1024          # 4 MiB
 LARGE_FILE_STREAM_THRESHOLD = 100 * 1024 * 1024  # 100 MiB
 
@@ -134,7 +134,10 @@ def check_itunes_backup_status(directory, backup_type):
     if not backup_encrypted and (backup_type == "db" or backup_type == "mbdb"):
         return True, False, "iTunes backup supported"
     if backup_encrypted and backup_type == "mbdb":
-        return False, True, "iTunes Legacy Encrypted Backup not supported"
+        # Mark legacy encrypted backups as supported so that decryption can be attempted.
+        # Caller sees "encrypted" and can decide whether to ask for password.
+        logfunc('Detected legacy encrypted iTunes backup')
+        return True, True, "iTunes Legacy Encrypted Backup"
     if backup_encrypted and backup_type == "db":
         logfunc('Detected encrypted iTunes backup')
         return True, True, "iTunes Encrypted Backup"
@@ -161,29 +164,33 @@ def decrypt_itunes_backup(directory, passcode):
             - "Incorrect password": Passcode was incorrect, could not unwrap protection class keys
             - "Could not find protection class for Manifest.db": Missing required protection class
     Notes:
-        - The function uses PBKDF2 key derivation with the passcode and keybag salt/iterations.
-        - For iOS < 10.2–style backups that do not carry DPSL/DPIC, we fall back to the
-          single-stage derivation (password + SALT/ITER) in line with common tooling.
-        - Protection class keys are unwrapped using AES key unwrapping.
-        - The manifest key class identifies which protection class is used for Manifest.db.
-        - Logs decryption status and errors using logfunc().
+        - The function uses PBKDF2 key derivation with the passcode and keybag salt/iterations
+        - Protection class keys are unwrapped using AES key unwrapping
+        - The manifest key class identifies which protection class is used for Manifest.db
+        - Logs decryption status and errors using logfunc()
     """
     protection_classes = {}
     manifest_key_class = None
+    manifest_wrapped_key = None
+
+    backup_type = get_itunes_backup_type(directory)
+
     manifest_path = os.path.join(directory, "Manifest.plist")
     manifest = get_plist_file_content(manifest_path)
 
     manifest_key = manifest.get("ManifestKey")
-    manifest_key_class = int.from_bytes(manifest_key[0:4], byteorder="little")
-    manifest_wrapped_key = manifest_key[4:]
+    if backup_type == "db" and manifest_key:
+        manifest_key_class = int.from_bytes(manifest_key[0:4], byteorder="little")
+        manifest_wrapped_key = manifest_key[4:]
+
     backup_keybag = manifest.get("BackupKeyBag")
 
     # Initialize some values
     tmp_backup_keybag_index = 0
     tmp_protection_class = {}
-    tmp_salt = b""
+    tmp_salt = b''
     tmp_iter = 0
-    tmp_double_protection_salt = b""
+    tmp_double_protection_salt = b''
     tmp_double_protection_iter = 0
     keybag_uuid = None
 
@@ -236,45 +243,23 @@ def decrypt_itunes_backup(directory, passcode):
     # Decrypt the Manifest password / derive backup key
     try:
         if passcode is None:
-            raise TypeError("No passcode")
+            raise TypeError("No password provided")
 
         pass_bytes = str.encode(passcode)
 
-        # Decide whether to use the "double protection" stage (DPSL/DPIC) or not.
-        # Older backup formats (iOS < 10.2) derive directly from password + SALT/ITER.
-        use_double_stage = bool(tmp_double_protection_salt and tmp_double_protection_iter)
-
-        product_version = manifest.get('Lockdown', {}).get('ProductVersion')
-        if product_version:
-            try:
-                parts = [int(p) for p in str(product_version).split(".")]
-                major = parts[0] if len(parts) > 0 else 0
-                minor = parts[1] if len(parts) > 1 else 0
-                # If clearly older than 10.2, ignore DPSL/DPIC even if present/mis-set
-                if major < 10 or (major == 10 and minor < 2):
-                    use_double_stage = False
-            except (TypeError, ValueError):
-                # If version parsing fails, keep whatever we deduced from the keybag itself
-                pass
-
-        if use_double_stage:
-            temp = hashlib.pbkdf2_hmac(
-                'sha256',
-                pass_bytes,
-                tmp_double_protection_salt,
-                tmp_double_protection_iter,
-            )
+        # For modern "db" backups with DPSL/DPIC we do two-stage derivation.
+        # For legacy backups (including mbdb) we fall back to a single-stage derivation.
+        if backup_type == "db" and tmp_double_protection_salt and tmp_double_protection_iter:
+            initial_unwrapped_key = hashlib.pbkdf2_hmac(
+                'sha256', pass_bytes, tmp_double_protection_salt,
+                tmp_double_protection_iter)
+            unwrapped_key = hashlib.pbkdf2_hmac(
+                'sha1', initial_unwrapped_key,
+                tmp_salt, tmp_iter, dklen=32)
         else:
-            # Legacy path: derive directly from the cleartext passcode
-            temp = pass_bytes
-
-        unwrapped_key = hashlib.pbkdf2_hmac(
-            'sha1',
-            temp,
-            tmp_salt,
-            tmp_iter,
-            dklen=32,
-        )
+            unwrapped_key = hashlib.pbkdf2_hmac(
+                'sha1', pass_bytes,
+                tmp_salt, tmp_iter, dklen=32)
     except TypeError:
         return None, "No password provided"
 
@@ -287,6 +272,12 @@ def decrypt_itunes_backup(directory, passcode):
         except crypt.InvalidUnwrap:
             logfunc("Could not unwrap a protection class key, likely due to an incorrect passcode. Exiting.")
             return None, "Incorrect password"
+
+    # Legacy (Manifest.mbdb) backups have no encrypted Manifest.db; keybag
+    # decryption is all we can and need to do.
+    if backup_type != "db":
+        logfunc(f"Backup keybag was successfully decrypted with passcode {passcode}")
+        return (protection_classes, None), "Decryption successful"
 
     # Find the right one for the Manifest.db
     if manifest_key_class not in protection_classes:
@@ -453,14 +444,15 @@ class FileSeekerItunes(FileSeekerBase):
             manifest_path = os.path.join(directory, "Manifest.db")
             if decryption_keys:
                 unwrapped_manifest_key = decryption_keys[1]
-                with open(manifest_path, "rb") as manifest_contents:
-                    cipher = Cipher(algorithms.AES(unwrapped_manifest_key),
-                                    modes.CBC(b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'))
-                    decryptor = cipher.decryptor()
-                    decrypted_manifest_contents = decryptor.update(manifest_contents.read()) + decryptor.finalize()
-                    manifest_path = os.path.join(data_folder, "Manifest.db")
-                    with open(manifest_path, "wb") as new_manifest_contents:
-                        new_manifest_contents.write(decrypted_manifest_contents)
+                if unwrapped_manifest_key:
+                    with open(manifest_path, "rb") as manifest_contents:
+                        cipher = Cipher(algorithms.AES(unwrapped_manifest_key),
+                                        modes.CBC(b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'))
+                        decryptor = cipher.decryptor()
+                        decrypted_manifest_contents = decryptor.update(manifest_contents.read()) + decryptor.finalize()
+                        manifest_path = os.path.join(data_folder, "Manifest.db")
+                        with open(manifest_path, "wb") as new_manifest_contents:
+                            new_manifest_contents.write(decrypted_manifest_contents)
 
             self.build_files_list_from_manifest_db(manifest_path)
         elif backup_type == "mbdb":
@@ -540,9 +532,10 @@ class FileSeekerItunes(FileSeekerBase):
         def getstring(data, offset, binary=False):
             """Retrieve a string and new offset from the current offset into the data"""
             if chr(data[offset]) == chr(0xFF) and chr(data[offset+1]) == chr(0xFF):
-                return '', offset+2  # Blank string
+                return (b'', offset+2) if binary else ('', offset+2)  # Blank string
             length, offset = getint(data, offset, 2)  # 2-byte length
-            value = "" if binary else data[offset:offset+length].decode()
+            raw = data[offset:offset+length]
+            value = raw if binary else raw.decode()
             return value, (offset + length)
 
         def process_mbdb_file(manifest_path):
@@ -556,9 +549,9 @@ class FileSeekerItunes(FileSeekerBase):
             while offset < len(data):
                 domain, offset = getstring(data, offset)
                 filename, offset = getstring(data, offset)
-                _, offset = getstring(data, offset, True)
-                _, offset = getstring(data, offset, True)
-                _, offset = getstring(data, offset, True)
+                linktarget, offset = getstring(data, offset, True)
+                datahash, offset = getstring(data, offset, True)
+                unknown1, offset = getstring(data, offset, True)
                 _, offset = getint(data, offset, 2)
                 _, offset = getint(data, offset, 4)
                 _, offset = getint(data, offset, 4)
@@ -567,14 +560,14 @@ class FileSeekerItunes(FileSeekerBase):
                 _, offset = getint(data, offset, 4)
                 _, offset = getint(data, offset, 4)
                 _, offset = getint(data, offset, 4)
-                _, offset = getint(data, offset, 8)
-                _, offset = getint(data, offset, 1)
+                filelen, offset = getint(data, offset, 8)
+                flag, offset = getint(data, offset, 1)
                 numprops, offset = getint(data, offset, 1)
                 for _ in range(numprops):
                     _, offset = getstring(data, offset, True)
                     _, offset = getstring(data, offset, True)
                 hash_filename = hashlib.sha1(f"{domain}-{filename}".encode()).hexdigest()
-                files.append((hash_filename, domain, filename))
+                files.append((hash_filename, domain, filename, unknown1, filelen, flag))
             return files
 
         try:
@@ -586,6 +579,17 @@ class FileSeekerItunes(FileSeekerBase):
                 relative_path = row[2]
                 full_path = os.path.join(root_path, relative_path)
                 self._all_files[full_path] = hash_filename
+
+                # Try to infer per-file encryption metadata from mbdb entry
+                if self.decryption_keys:
+                    unknown1 = row[3]
+                    filelen = row[4]
+                    flag = row[5]
+                    if unknown1 and isinstance(unknown1, (bytes, bytearray)) and len(unknown1) > 4:
+                        self._all_file_meta[full_path] = {}
+                        self._all_file_meta[full_path]['Class'] = flag
+                        self._all_file_meta[full_path]['Key'] = unknown1[4:]
+                        self._all_file_meta[full_path]['Size'] = filelen
         except Exception as ex:
             logfunc(f'Error opening Manifest.mbdb from {self.directory}, ' + str(ex))
             raise ex
@@ -618,78 +622,82 @@ class FileSeekerItunes(FileSeekerBase):
                     # Handle encrypted backups differently, don't just copy the encrypted files
                     if self.decryption_keys:
                         protection_classes = self.decryption_keys[0]
-                        # Snag the right protection class
-                        tmp_file_meta = self._all_file_meta[relative_path]
-                        if tmp_file_meta['Class'] not in protection_classes:
-                            logfunc(f'Can\'t locate the protection class for {relative_path}: {tmp_file_meta["Class"]}')
-                            raise KeyError
-                        tmp_protection_class = protection_classes[tmp_file_meta['Class']]
+                        tmp_file_meta = self._all_file_meta.get(relative_path)
 
-                        # Grab the file's key
-                        tmp_file_wrapped_key = tmp_file_meta['Key']
-                        tmp_file_unwrapped_key = crypt.aes_key_unwrap(tmp_protection_class['Unwrapped'],
-                                                                      tmp_file_wrapped_key)
-
-                        expected_size = tmp_file_meta.get('Size')
-
-                        # For large files, use streaming decryption + streaming write
-                        if expected_size is not None and expected_size > LARGE_FILE_STREAM_THRESHOLD:
-                            cipher = Cipher(
-                                algorithms.AES(tmp_file_unwrapped_key),
-                                modes.CBC(b'\x00' * 16)
-                            )
-                            decryptor = cipher.decryptor()
-
-                            with open(original_location, "rb") as temp_original_file, \
-                                    open(data_path, "wb") as temp_new_file:
-                                remaining = expected_size
-                                while True:
-                                    chunk = temp_original_file.read(DECRYPT_CHUNK_SIZE)
-                                    if not chunk:
-                                        break
-                                    decrypted_chunk = decryptor.update(chunk)
-
-                                    if expected_size is None:
-                                        if decrypted_chunk:
-                                            temp_new_file.write(decrypted_chunk)
-                                        continue
-
-                                    if remaining <= 0:
-                                        continue
-
-                                    if len(decrypted_chunk) > remaining:
-                                        temp_new_file.write(decrypted_chunk[:remaining])
-                                        remaining = 0
-                                    else:
-                                        temp_new_file.write(decrypted_chunk)
-                                        remaining -= len(decrypted_chunk)
-
-                                tail = decryptor.finalize()
-                                if expected_size is None:
-                                    if tail:
-                                        temp_new_file.write(tail)
-                                elif remaining > 0 and tail:
-                                    if len(tail) > remaining:
-                                        temp_new_file.write(tail[:remaining])
-                                    else:
-                                        temp_new_file.write(tail)
+                        if not tmp_file_meta or 'Class' not in tmp_file_meta or 'Key' not in tmp_file_meta:
+                            # No encryption metadata for this file, fall back to raw copy
+                            copyfile(original_location, data_path)
                         else:
-                            # For small/normal files, keep simple one-shot decryption
-                            with open(original_location, "rb") as temp_original_file:
+                            if tmp_file_meta['Class'] not in protection_classes:
+                                logfunc(f'Can\'t locate the protection class for {relative_path}: {tmp_file_meta["Class"]}')
+                                raise KeyError
+                            tmp_protection_class = protection_classes[tmp_file_meta['Class']]
+
+                            # Grab the file's key
+                            tmp_file_wrapped_key = tmp_file_meta['Key']
+                            tmp_file_unwrapped_key = crypt.aes_key_unwrap(tmp_protection_class['Unwrapped'],
+                                                                          tmp_file_wrapped_key)
+
+                            expected_size = tmp_file_meta.get('Size')
+
+                            # For large files, use streaming decryption + streaming write
+                            if expected_size is not None and expected_size > LARGE_FILE_STREAM_THRESHOLD:
                                 cipher = Cipher(
                                     algorithms.AES(tmp_file_unwrapped_key),
                                     modes.CBC(b'\x00' * 16)
                                 )
                                 decryptor = cipher.decryptor()
-                                decrypted_contents = (
-                                    decryptor.update(temp_original_file.read()) +
-                                    decryptor.finalize()
-                                )
-                                with open(data_path, "wb") as temp_new_file:
+
+                                with open(original_location, "rb") as temp_original_file, \
+                                        open(data_path, "wb") as temp_new_file:
+                                    remaining = expected_size
+                                    while True:
+                                        chunk = temp_original_file.read(DECRYPT_CHUNK_SIZE)
+                                        if not chunk:
+                                            break
+                                        decrypted_chunk = decryptor.update(chunk)
+
+                                        if expected_size is None:
+                                            if decrypted_chunk:
+                                                temp_new_file.write(decrypted_chunk)
+                                            continue
+
+                                        if remaining <= 0:
+                                            continue
+
+                                        if len(decrypted_chunk) > remaining:
+                                            temp_new_file.write(decrypted_chunk[:remaining])
+                                            remaining = 0
+                                        else:
+                                            temp_new_file.write(decrypted_chunk)
+                                            remaining -= len(decrypted_chunk)
+
+                                    tail = decryptor.finalize()
                                     if expected_size is None:
-                                        temp_new_file.write(decrypted_contents)
-                                    else:
-                                        temp_new_file.write(decrypted_contents[0:expected_size])
+                                        if tail:
+                                            temp_new_file.write(tail)
+                                    elif remaining > 0 and tail:
+                                        if len(tail) > remaining:
+                                            temp_new_file.write(tail[:remaining])
+                                        else:
+                                            temp_new_file.write(tail)
+                            else:
+                                # For small/normal files, keep simple one-shot decryption
+                                with open(original_location, "rb") as temp_original_file:
+                                    cipher = Cipher(
+                                        algorithms.AES(tmp_file_unwrapped_key),
+                                        modes.CBC(b'\x00' * 16)
+                                    )
+                                    decryptor = cipher.decryptor()
+                                    decrypted_contents = (
+                                        decryptor.update(temp_original_file.read()) +
+                                        decryptor.finalize()
+                                    )
+                                    with open(data_path, "wb") as temp_new_file:
+                                        if expected_size is None:
+                                            temp_new_file.write(decrypted_contents)
+                                        else:
+                                            temp_new_file.write(decrypted_contents[0:expected_size])
 
                     # If not encrypted, just copy the thing
                     else:
