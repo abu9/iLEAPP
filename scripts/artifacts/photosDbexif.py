@@ -1,16 +1,18 @@
 import os
 from datetime import datetime
-from pathlib import Path
-
 import pytz
 from PIL import Image
 from pillow_heif import register_heif_opener
 
-from scripts.artifact_report import ArtifactHtmlReport  # 兼容旧 wrapper，虽然不直接用
+from scripts.artifact_report import ArtifactHtmlReport
 from scripts.ilapfuncs import (
     logfunc,
-    open_sqlite_db_readonly,
-    check_in_media,
+    tsv,
+    timeline,
+    kmlgen,
+    is_platform_windows,
+    media_to_html,
+    open_sqlite_db_readonly
 )
 
 
@@ -19,429 +21,534 @@ def isclose(a, b, rel_tol=1e-06, abs_tol=0.0):
 
 
 def get_exif(filename):
-    image = Image.open(filename)
-    image.verify()
-    return image.getexif().get_ifd(0x8825)
+    """
+    只拿 GPS IFD（0x8825）。如果文件没有 EXIF/GPS，返回 None。
+    """
+    try:
+        with Image.open(filename) as img:
+            getexif = getattr(img, "getexif", None)
+            if getexif is None:
+                return None
+
+            exif = getexif()
+            if not exif:
+                return None
+
+            try:
+                return exif.get_ifd(0x8825)
+            except Exception:
+                return None
+    except Exception as ex:
+        logfunc(f'get_exif() failed on {filename}: {ex}')
+        return None
 
 
 def get_all_exif(filename):
-    image = Image.open(filename)
-    image.verify()
-    return image.getexif()
+    """
+    返回完整 EXIF dict，失败时返回空 dict，不再抛异常。
+    """
+    try:
+        with Image.open(filename) as img:
+            getexif = getattr(img, "getexif", None)
+            if getexif is None:
+                return {}
+            exif = getexif()
+            return exif if exif else {}
+    except Exception as ex:
+        logfunc(f'get_all_exif() failed on {filename}: {ex}')
+        return {}
 
 
 def get_geotagging(exif):
-    """把 EXIF GPS IFD 转成更好用的 dict，可能返回 None。"""
+    geo_tagging_info = {}
     if not exif:
         return None
 
     gps_keys = [
-        "GPSVersionID", "GPSLatitudeRef", "GPSLatitude", "GPSLongitudeRef", "GPSLongitude",
-        "GPSAltitudeRef", "GPSAltitude", "GPSTimeStamp", "GPSSatellites", "GPSStatus",
-        "GPSMeasureMode", "GPSDOP", "GPSSpeedRef", "GPSSpeed", "GPSTrackRef", "GPSTrack",
-        "GPSImgDirectionRef", "GPSImgDirection", "GPSMapDatum", "GPSDestLatitudeRef",
-        "GPSDestLatitude", "GPSDestLongitudeRef", "GPSDestLongitude", "GPSDestBearingRef",
-        "GPSDestBearing", "GPSDestDistanceRef", "GPSDestDistance", "GPSProcessingMethod",
-        "GPSAreaInformation", "GPSDateStamp", "GPSDifferential",
+        'GPSVersionID', 'GPSLatitudeRef', 'GPSLatitude', 'GPSLongitudeRef',
+        'GPSLongitude', 'GPSAltitudeRef', 'GPSAltitude', 'GPSTimeStamp',
+        'GPSSatellites', 'GPSStatus', 'GPSMeasureMode', 'GPSDOP',
+        'GPSSpeedRef', 'GPSSpeed', 'GPSTrackRef', 'GPSTrack',
+        'GPSImgDirectionRef', 'GPSImgDirection', 'GPSMapDatum',
+        'GPSDestLatitudeRef', 'GPSDestLatitude', 'GPSDestLongitudeRef',
+        'GPSDestLongitude', 'GPSDestBearingRef', 'GPSDestBearing',
+        'GPSDestDistanceRef', 'GPSDestDistance', 'GPSProcessingMethod',
+        'GPSAreaInformation', 'GPSDateStamp', 'GPSDifferential'
     ]
 
-    geo_tagging_info = {}
     for k, v in exif.items():
         try:
             geo_tagging_info[gps_keys[k]] = str(v)
         except IndexError:
-            # 未知的 GPS tag index，直接跳过
-            continue
+            # 忽略我们没列在 gps_keys 里的索引
+            pass
     return geo_tagging_info
 
 
-def _table_exists(cursor, table_name):
-    cursor.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-        (table_name,),
-    )
-    return cursor.fetchone() is not None
-
-
-def _detect_asset_table(cursor):
+def _get_asset_table_and_columns(db, db_path):
     """
-    尝试检测当前 Photos.sqlite 使用哪个主表：
-    - 新: ZASSET
-    - 旧: ZGENERICASSET
-    返回表名字符串，或 None。
+    运行时探测 Photos.sqlite 的主资产表（ZASSET 或 ZGENERICASSET），
+    并返回：
+      - asset_table: 实际使用的表名
+      - asset_cols: 该表的列名集合
+      - add_cols: ZADDITIONALASSETATTRIBUTES 的列名集合（如存在）
+      - has_additional: 是否存在 ZADDITIONALASSETATTRIBUTES
     """
-    if _table_exists(cursor, "ZASSET"):
-        return "ZASSET"
-    if _table_exists(cursor, "ZGENERICASSET"):
-        return "ZGENERICASSET"
-    return None
-
-
-def _build_media_index(files_found):
-    """
-    建一个 { (directory, filename): full_extracted_path } 索引，
-    方便按 ZDIRECTORY / ZFILENAME 反查解密后的真实文件路径。
-
-    directory 格式尽量对齐 DB：
-      - 如果真实路径里有 .../Media/DCIM/100APPLE/IMG_xxx.JPG
-        那么 key 就是 ('DCIM/100APPLE', 'IMG_xxx.JPG')
-    """
-    index = {}
-
-    for path in files_found:
-        lower = path.lower()
-        if not lower.endswith((".jpg", ".jpeg", ".png", ".heic")):
-            continue
-
-        norm = path.replace("\\", "/")
-        lower_norm = norm.lower()
-        media_pos = lower_norm.find("/media/")
-        if media_pos == -1:
-            # 不在 Media 下的图片（比如别的应用私有路径），此处先不管
-            continue
-
-        after_media = norm[media_pos + len("/media/"):]  # 比如 'DCIM/100APPLE/IMG_0001.JPG'
-        if "/" not in after_media:
-            # 没有子目录，不是典型 DCIM 结构
-            continue
-
-        dir_part, filename = after_media.rsplit("/", 1)
-        key = (dir_part, filename)
-        index[key] = path
-
-    return index
-
-
-def _match_media_path(media_index, zdirectory, zfilename):
-    """
-    根据 DB 里的 ZDIRECTORY / ZFILENAME，在 media_index 里面找文件路径。
-    兼容几种常见目录写法：
-      - 'DCIM/100APPLE'
-      - '100APPLE'
-    """
-    if not zdirectory:
-        return None
-
-    zdirectory = zdirectory.strip("/")
-
-    candidates = [zdirectory]
-    if not zdirectory.lower().startswith("dcim/"):
-        candidates.append(f"DCIM/{zdirectory}")
-
-    for d in candidates:
-        key = (d, zfilename)
-        if key in media_index:
-            return media_index[key]
-
-    return None
-
-
-def get_photosDbexif(context):
-    """
-    Photos.sqlite + EXIF 比对：
-    - 从 Photos.sqlite(ZASSET / ZGENERICASSET) 读出
-      时间、目录、文件名、DB 中经纬度、Bundle ID
-    - 在已解密出的 DCIM 目录中查找对应文件
-    - 解析 EXIF 时间和经纬度
-    - 比较 DB 与 EXIF 的时间 / 坐标是否一致
-    - 使用 check_in_media 注册媒体文件（给 LAVA / 报表使用）
-    """
-
-    files_found = context.files_found
-    report_folder = context.report_folder  # 未直接用，但保留以防后续扩展
-    seeker = context.seeker                # 未直接用
-    timezone_offset = context.timezone_offset  # 未直接用，但保留接口一致性
-
-    # 找 Photos.sqlite
-    photos_dbs = [f for f in files_found if f.endswith("Photos.sqlite")]
-    if not photos_dbs:
-        logfunc("PhotosDbexif: No Photos.sqlite found")
-        return [], [], ""
-
-    source_file = photos_dbs[0]  # 通常只有一个，先按一个处理
-
-    # 先把所有图片路径索引起来： (ZDIRECTORY, ZFILENAME) -> extracted_path
-    media_index = _build_media_index(files_found)
-
-    data_list = []
-
-    db = open_sqlite_db_readonly(source_file)
     cursor = db.cursor()
 
-    asset_table = _detect_asset_table(cursor)
-    if not asset_table:
-        logfunc(
-            "PhotosDbexif: Neither ZASSET nor ZGENERICASSET found in Photos.sqlite; "
-            "unsupported schema."
-        )
-        db.close()
-        return [], [], source_file
+    # 检查资产表
+    cursor.execute("""
+        SELECT name
+        FROM sqlite_master
+        WHERE type='table' AND name IN ('ZASSET','ZGENERICASSET')
+    """)
+    table_rows = cursor.fetchall()
+    if not table_rows:
+        logfunc(f'Photos.sqlite: neither ZASSET nor ZGENERICASSET found in {db_path}')
+        return None, set(), set(), False
 
-    # 构造针对不同主表的 SQL
+    # 如果两个都在，按名字排序（ZASSET 优先）
+    asset_table = sorted({row[0] for row in table_rows})[0]
+
+    def get_columns(table_name):
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        return {row[1] for row in cursor.fetchall()}
+
+    asset_cols = get_columns(asset_table)
+
+    # 额外属性表
+    cursor.execute("""
+        SELECT name
+        FROM sqlite_master
+        WHERE type='table' AND name='ZADDITIONALASSETATTRIBUTES'
+    """)
+    has_additional = bool(cursor.fetchall())
+    add_cols = get_columns('ZADDITIONALASSETATTRIBUTES') if has_additional else set()
+
+    return asset_table, asset_cols, add_cols, has_additional
+
+
+def _build_photos_query(asset_table, asset_cols, add_cols, has_additional):
+    """
+    根据实际存在的列构造 SQL 语句，只引用真实存在的列。
+    返回 (sql, uses_lat_lon)：
+      - sql: 最终 SELECT 语句
+      - uses_lat_lon: 是否真正从库里读到了经纬度列
+    """
+    select_cols = []
+
+    # ZDATECREATED
+    if 'ZDATECREATED' in asset_cols:
+        select_cols.append(
+            f"DATETIME({asset_table}.ZDATECREATED+978307200,'UNIXEPOCH') AS DATECREATED"
+        )
+    else:
+        select_cols.append("NULL AS DATECREATED")
+
+    # ZMODIFICATIONDATE
+    if 'ZMODIFICATIONDATE' in asset_cols:
+        select_cols.append(
+            f"DATETIME({asset_table}.ZMODIFICATIONDATE+978307200,'UNIXEPOCH') AS MODIFICATIONDATE"
+        )
+    else:
+        select_cols.append("NULL AS MODIFICATIONDATE")
+
+    # 路径信息
+    if 'ZDIRECTORY' in asset_cols:
+        select_cols.append(f"{asset_table}.ZDIRECTORY AS DIRECTORY")
+    else:
+        select_cols.append("NULL AS DIRECTORY")
+
+    if 'ZFILENAME' in asset_cols:
+        select_cols.append(f"{asset_table}.ZFILENAME AS FILENAME")
+    else:
+        select_cols.append("NULL AS FILENAME")
+
+    uses_lat_lon = False
+
+    # 经纬度：优先资产表，其次附加属性表，否则用 NULL
+    if 'ZLATITUDE' in asset_cols and 'ZLONGITUDE' in asset_cols:
+        select_cols.append(f"{asset_table}.ZLATITUDE AS LATITUDE")
+        select_cols.append(f"{asset_table}.ZLONGITUDE AS LONGITUDE")
+        uses_lat_lon = True
+    elif 'ZLATITUDE' in add_cols and 'ZLONGITUDE' in add_cols:
+        select_cols.append("ZADDITIONALASSETATTRIBUTES.ZLATITUDE AS LATITUDE")
+        select_cols.append("ZADDITIONALASSETATTRIBUTES.ZLONGITUDE AS LONGITUDE")
+        uses_lat_lon = True
+    else:
+        select_cols.append("NULL AS LATITUDE")
+        select_cols.append("NULL AS LONGITUDE")
+
+    # Bundle ID
+    if has_additional and 'ZCREATORBUNDLEID' in add_cols:
+        select_cols.append("ZADDITIONALASSETATTRIBUTES.ZCREATORBUNDLEID AS CREATORBUNDLEID")
+    else:
+        select_cols.append("NULL AS CREATORBUNDLEID")
+
+    join_sql = ""
+    if has_additional:
+        join_sql = (
+            f" INNER JOIN ZADDITIONALASSETATTRIBUTES "
+            f"ON {asset_table}.Z_PK = ZADDITIONALASSETATTRIBUTES.Z_PK"
+        )
+
+    select_sql = ",\n            ".join(select_cols)
+
     query = f"""
         SELECT
-            DATETIME({asset_table}.ZDATECREATED+978307200,'UNIXEPOCH') AS DATECREATED,
-            DATETIME({asset_table}.ZMODIFICATIONDATE+978307200,'UNIXEPOCH') AS MODIFICATIONDATE,
-            {asset_table}.ZDIRECTORY,
-            {asset_table}.ZFILENAME,
-            {asset_table}.ZLATITUDE,
-            {asset_table}.ZLONGITUDE,
-            ZADDITIONALASSETATTRIBUTES.ZCREATORBUNDLEID
+            {select_sql}
         FROM {asset_table}
-        LEFT JOIN ZADDITIONALASSETATTRIBUTES
-            ON {asset_table}.Z_PK = ZADDITIONALASSETATTRIBUTES.Z_PK
+        {join_sql}
     """
 
+    return query, uses_lat_lon
+
+
+def _match_photo_files(files_found, zdirectory, zfilename):
+    """
+    尝试在 files_found 里找到与 (zdirectory, zfilename) 对应的解密后实际文件路径。
+    返回第一个匹配到的路径字符串，找不到则返回 None。
+    """
+    if not zdirectory or not zfilename:
+        return None
+
+    path_parts = str(zdirectory).split('/')
+    if len(path_parts) < 2:
+        return None
+
+    part0, part1 = path_parts[0], path_parts[1]
+
+    for search in files_found:
+        search = str(search)
+        if part0 in search and part1 in search and str(zfilename) in search:
+            return search
+
+    return None
+
+
+def _build_thumbnail(search_path, zfilename, report_folder, files_found):
+    """
+    根据文件类型构建缩略图 HTML。
+    """
+    thumb = ''
+
+    searchbase = os.path.basename(search_path)
+
+    if search_path.upper().endswith('HEIC'):
+        try:
+            register_heif_opener()
+            with Image.open(search_path) as image:
+                convertedfilepath = os.path.join(report_folder, f'{searchbase}.jpg')
+                image.save(convertedfilepath)
+            convertedlist = [convertedfilepath]
+            thumb = media_to_html(f'{searchbase}.jpg', convertedlist, report_folder)
+        except Exception as ex:
+            logfunc(f'Error converting HEIC to JPG for {search_path}: {ex}')
+    elif (search_path.upper().endswith('JPG') or
+          search_path.upper().endswith('PNG') or
+          search_path.upper().endswith('JPEG')):
+        thumb = media_to_html(zfilename, files_found, report_folder)
+
+    return thumb
+
+
+def _extract_exif_and_compare(search_path, zdatecreated, zlatitude, zlongitude):
+    """
+    读取 EXIF / GPS，比较与 DB 经纬度 & 时间。
+    返回：
+      suspecttime, offset, suspectcoordinates, creationchanged, latitude, longitude, exifdata
+    """
+    suspecttime = ''
+    offset = ''
+    suspectcoordinates = ''
+    creationchanged = ''
+    latitude = ''
+    longitude = ''
+    exifdata = ''
+
+    # 只对常见图片格式尝试读 EXIF
+    if not (search_path.upper().endswith('JPG') or
+            search_path.upper().endswith('PNG') or
+            search_path.upper().endswith('JPEG') or
+            search_path.upper().endswith('HEIC')):
+        return suspecttime, offset, suspectcoordinates, creationchanged, latitude, longitude, exifdata
+
     try:
-        cursor.execute(query)
-        rows = cursor.fetchall()
-    except Exception as ex:
-        logfunc(f"PhotosDbexif: Error querying {asset_table} from Photos.sqlite - {ex}")
-        db.close()
-        return [], [], source_file
+        image_info = get_exif(search_path)
+        results = get_geotagging(image_info)
 
-    db.close()
+        # 经纬度
+        if results is None:
+            latitude = ''
+            longitude = ''
+        else:
+            directionlat = results.get('GPSLatitudeRef')
+            latitude_raw = results.get('GPSLatitude')
+            directionlon = results.get('GPSLongitudeRef')
+            longitude_raw = results.get('GPSLongitude')
 
-    if not rows:
-        logfunc("PhotosDbexif: No asset rows found in Photos.sqlite")
-        return [], [], source_file
+            if latitude_raw and directionlat:
+                lat_parts = (
+                    latitude_raw.replace('(', '')
+                    .replace(')', '')
+                    .split(', ')
+                )
+                latitude = (
+                    float(lat_parts[0]) +
+                    float(lat_parts[1]) / 60 +
+                    float(lat_parts[2]) / (60 * 60)
+                )
+                if directionlat in ['W', 'S']:
+                    latitude *= -1
+            else:
+                latitude = ''
 
-    # 为可能的 HEIC 添加支持
-    try:
-        register_heif_opener()
-    except Exception:
-        # pillow-heif 不可用也无所谓，只是 HEIC 可能无法读 EXIF
-        pass
+            if longitude_raw and directionlon:
+                lon_parts = (
+                    longitude_raw.replace('(', '')
+                    .replace(')', '')
+                    .split(', ')
+                )
+                longitude = (
+                    float(lon_parts[0]) +
+                    float(lon_parts[1]) / 60 +
+                    float(lon_parts[2]) / (60 * 60)
+                )
+                if directionlon in ['W', 'S']:
+                    longitude *= -1
+            else:
+                longitude = ''
 
-    for row in rows:
-        (
-            zdatecreated,
-            zmodificationdate,
-            zdirectory,
-            zfilename,
-            zlatitude,
-            zlongitude,
-            zbundlecreator,
-        ) = row
+        # 全部 EXIF 文本
+        exifall = get_all_exif(search_path)
+        for x, y in exifall.items():
+            if x == 271:
+                exifdata += f'Manufacturer: {y}<br>'
+            elif x == 272:
+                exifdata += f'Model: {y}<br>'
+            elif x == 305:
+                exifdata += f'Software: {y}<br>'
+            elif x == 274:
+                exifdata += f'Orientation: {y}<br>'
+            elif x == 306:
+                exifdata += f'Creation/Changed: {y}<br>'
+                creationchanged = y
+            elif x == 282:
+                exifdata += f'Resolution X: {y}<br>'
+            elif x == 283:
+                exifdata += f'Resolution Y: {y}<br>'
+            elif x == 316:
+                exifdata += f'Host device: {y}<br>'
+            else:
+                exifdata += f'{x}: {y}<br>'
 
-        media_path = _match_media_path(media_index, zdirectory or "", zfilename or "")
-        media_ref = None
-        suspect_time = ""
-        suspect_coordinates = ""
-        offset = ""
-        creationchanged = ""
-        latitude = ""
-        longitude = ""
-        exifdata = ""
+        # 经纬度对比（只有 DB 里是 float 且 EXIF 里也有数值时才比较）
+        if isinstance(zlatitude, float) and isinstance(latitude, float):
+            suspectA = isclose(zlatitude, latitude)
+            if isinstance(zlongitude, float) and isinstance(longitude, float):
+                suspectB = isclose(zlongitude, longitude)
+                if suspectA and suspectB:
+                    suspectcoordinates = 'True'
+                else:
+                    suspectcoordinates = 'False'
+            else:
+                suspectcoordinates = ''
+        else:
+            suspectcoordinates = ''
 
-        # 默认: 坐标是否一致 = 空（未知）
-        suspect_coordinates = ""
+        # 时间对比：DB 时间为 UTC，EXIF 通常是本地时间
+        if creationchanged and zdatecreated:
+            mytz = pytz.timezone('UTC')
 
-        # 如果能在解密后的文件中找到实际文件，再去跑 EXIF 与 GPS
-        if media_path and os.path.exists(media_path):
             try:
-                # 注册媒体文件（给 LAVA / 报表）
-                # 这里直接传已经解密好的绝对路径，避免再次去匹配原始路径。
-                media_ref = check_in_media(media_path, name=zfilename)
+                dbdate = datetime.fromisoformat(zdatecreated)
+                dbdate = mytz.normalize(mytz.localize(dbdate, is_dst=True))
+            except Exception:
+                dbdate = None
 
-                lower = media_path.lower()
-                if lower.endswith(".heic"):
-                    # register_heif_opener 已经调用，这里只是确保可以被 PIL 打开
-                    pass
+            exifdate = creationchanged.replace(':', '-', 2)
+            creationchanged = exifdate
+            exifdate_trim = exifdate[:-1]
 
-                # EXIF + GPS
-                try:
-                    gps_ifd = get_exif(media_path)
-                    gps_info = get_geotagging(gps_ifd)
+            responsive = ''
+            suspecttime = 'False'
+            offset = ''
 
-                    if gps_info is None:
-                        latitude = ""
-                        longitude = ""
-                    else:
-                        # 解析纬度
-                        directionlat = gps_info.get("GPSLatitudeRef")
-                        lat_raw = gps_info.get("GPSLatitude")
-                        if lat_raw:
-                            lat_values = (
-                                lat_raw.replace("(", "").replace(")", "").split(", ")
-                            )
-                            lat_deg = float(lat_values[0])
-                            lat_min = float(lat_values[1])
-                            lat_sec = float(lat_values[2])
-                            latitude = (
-                                lat_deg
-                                + lat_min / 60.0
-                                + lat_sec / (60.0 * 60.0)
-                            )
-                            if directionlat in ["W", "S"]:
-                                latitude = -latitude
+            if dbdate:
+                time_list = []
+                for timeZone in pytz.all_timezones:
+                    dbtimezonedate = dbdate.astimezone(pytz.timezone(timeZone))
+                    time_list.append((str(dbtimezonedate), timeZone))
 
-                        # 解析经度
-                        directionlon = gps_info.get("GPSLongitudeRef")
-                        lon_raw = gps_info.get("GPSLongitude")
-                        if lon_raw:
-                            lon_values = (
-                                lon_raw.replace("(", "").replace(")", "").split(", ")
-                            )
-                            lon_deg = float(lon_values[0])
-                            lon_min = float(lon_values[1])
-                            lon_sec = float(lon_values[2])
-                            longitude = (
-                                lon_deg
-                                + lon_min / 60.0
-                                + lon_sec / (60.0 * 60.0)
-                            )
-                            if directionlon in ["W", "S"]:
-                                longitude = -longitude
-                except Exception:
-                    gps_info = None
-                    latitude = ""
-                    longitude = ""
+                for dt_str, _tz_name in time_list:
+                    if exifdate_trim in dt_str:
+                        responsive = dt_str
+                        suspecttime = 'True'
+                        break
+                    elif exifdate_trim[:-1] in dt_str[:-7]:
+                        responsive = dt_str
+                        suspecttime = 'True'
+                        break
+                    elif exifdate_trim[:-2] in dt_str[:-8]:
+                        responsive = dt_str
+                        suspecttime = 'True'
+                        break
 
-                # 把完整 EXIF 列出来，同时提取 Creation/Changed 时间字段
-                try:
-                    exif_all = get_all_exif(media_path)
-                    exifdata_parts = []
-                    for tag, value in exif_all.items():
-                        if tag == 271:
-                            exifdata_parts.append(f"Manufacturer: {value}")
-                        elif tag == 272:
-                            exifdata_parts.append(f"Model: {value}")
-                        elif tag == 305:
-                            exifdata_parts.append(f"Software: {value}")
-                        elif tag == 274:
-                            exifdata_parts.append(f"Orientation: {value}")
-                        elif tag == 306:
-                            exifdata_parts.append(f"Creation/Changed: {value}")
-                            creationchanged = str(value)
-                        elif tag == 282:
-                            exifdata_parts.append(f"Resolution X: {value}")
-                        elif tag == 283:
-                            exifdata_parts.append(f"Resolution Y: {value}")
-                        elif tag == 316:
-                            exifdata_parts.append(f"Host device: {value}")
-                        else:
-                            exifdata_parts.append(f"{tag}: {value}")
-                    exifdata = "<br>".join(exifdata_parts)
-                except Exception:
-                    exifdata = ""
-                    creationchanged = ""
+                if responsive:
+                    offset = responsive[-6:]
 
-                # DB 坐标 vs EXIF 坐标是否可疑
-                if isinstance(zlatitude, float) and isinstance(latitude, float):
-                    lat_ok = isclose(zlatitude, latitude)
-                else:
-                    lat_ok = None
+    except Exception as ex:
+        logfunc(f'Error getting exif on: {search_path} ({ex})')
 
-                if isinstance(zlongitude, float) and isinstance(longitude, float):
-                    lon_ok = isclose(zlongitude, longitude)
-                else:
-                    lon_ok = None
+    return suspecttime, offset, suspectcoordinates, creationchanged, latitude, longitude, exifdata
 
-                if lat_ok is None or lon_ok is None:
-                    suspect_coordinates = ""
-                else:
-                    suspect_coordinates = "True" if (lat_ok and lon_ok) else "False"
 
-                # DB 时间 vs EXIF 时间差异（通过枚举时区猜 offset）
-                if creationchanged and zdatecreated:
-                    try:
-                        mytz = pytz.timezone("UTC")
-                        dbdate = datetime.fromisoformat(zdatecreated)
-                        dbdate = mytz.localize(dbdate, is_dst=True)
+def get_photosDbexif(files_found, report_folder, seeker, wrap_text, timezone_offset):
+    for file_found in files_found:
+        file_found = str(file_found)
 
-                        exifdate_str = creationchanged.replace(":", "-", 2)
-                        # 有些 EXIF 时间可能没有时区或秒后的小数，这里逐步放宽比对
-                        exifdate_trim1 = exifdate_str[:-1]
-                        exifdate_trim2 = exifdate_str[:-2]
+        filename = os.path.basename(file_found)
+        if not filename.lower().endswith('photos.sqlite'):
+            # 只关心 Photos.sqlite
+            continue
 
-                        suspect_time = "False"
-                        responsive = ""
+        data_list = []
 
-                        for tzname in pytz.all_timezones:
-                            tz = pytz.timezone(tzname)
-                            db_tz_time = dbdate.astimezone(tz)
-                            db_tz_str = str(db_tz_time)
+        db = open_sqlite_db_readonly(file_found)
+        try:
+            asset_table, asset_cols, add_cols, has_additional = _get_asset_table_and_columns(db, file_found)
+            if not asset_table:
+                db.close()
+                continue
 
-                            if exifdate_str in db_tz_str:
-                                responsive = db_tz_str
-                                suspect_time = "True"
-                                break
-                            if exifdate_trim1 and exifdate_trim1 in db_tz_str[:-7]:
-                                responsive = db_tz_str
-                                suspect_time = "True"
-                                break
-                            if exifdate_trim2 and exifdate_trim2 in db_tz_str[:-8]:
-                                responsive = db_tz_str
-                                suspect_time = "True"
-                                break
+            query, _ = _build_photos_query(asset_table, asset_cols, add_cols, has_additional)
 
-                        if responsive:
-                            offset = responsive[-6:]
-                        else:
-                            offset = ""
-                    except Exception:
-                        suspect_time = ""
-                        offset = ""
+            cursor = db.cursor()
+            cursor.execute(query)
+            all_rows = cursor.fetchall()
+            usageentries = len(all_rows)
 
-            except Exception as ex:
-                logfunc(f"PhotosDbexif: Error processing media file '{media_path}' - {ex}")
-                media_ref = None
+        except Exception as ex:
+            logfunc(f'Error executing Photos.sqlite query ({filename}) at {file_found}: {ex}')
+            all_rows = []
+            usageentries = 0
+        finally:
+            db.close()
 
-        # 记录一行。注意第一列是 media 类型，配合 data_headers 里的 ('Media', 'media')
-        data_list.append(
-            (
-                media_ref,           # Media (LAVA media reference)
-                suspect_time,        # Same Timestamps?
-                offset,              # Possible Exif Offset
-                suspect_coordinates, # Same Coordinates?
-                zdatecreated,        # Timestamp (DB)
-                zmodificationdate,   # Timestamp Modification (DB)
-                zdirectory,          # Directory
-                zfilename,           # Filename
-                zlatitude,           # Latitude DB
-                zlongitude,          # Longitude DB
-                creationchanged,     # Exif Creation/Changed
-                latitude,            # Latitude (EXIF)
-                longitude,           # Longitude (EXIF)
-                exifdata,            # Exif (HTML)
-                zbundlecreator,      # Bundle Creator
+        if usageentries <= 0:
+            logfunc('No Photos.sqlite Analysis data available')
+            continue
+
+        # 处理每一条 DB 记录
+        for row in all_rows:
+            (thumb, suspecttime, suspectcoordinates,
+             zdatecreated, zmodificationdate, zdirectory, zfilename,
+             zlatitude, zlongitude, creationchanged,
+             latitude, longitude, exifdata, zbundlecreator) = (
+                '', '', '', '', '', '', '',
+                '', '', '', '', '', '', ''
             )
-        )
 
-    if not data_list:
-        logfunc("PhotosDbexif: No Photos.sqlite Analysis data available")
-        return [], [], source_file
+            zdatecreated = row[0]
+            zmodificationdate = row[1]
+            zdirectory = row[2]
+            zfilename = row[3]
+            zlatitude = row[4]
+            zlongitude = row[5]
+            zbundlecreator = row[6]
 
-    logfunc(f"PhotosDbexif: Generated {len(data_list)} rows for Photos.sqlite Analysis")
+            # 找对应文件
+            matched_path = _match_photo_files(files_found, zdirectory, zfilename)
+            if not matched_path:
+                continue
 
-    # 第一列是 media 类型，告知 LAVA / 报表系统用媒体渲染
-    data_headers = (
-        ("Media", "media"),
-        "Same Timestamps?",
-        "Possible Exif Offset",
-        "Same Coordinates?",
-        "Timestamp",
-        "Timestamp Modification",
-        "Directory",
-        "Filename",
-        "Latitude DB",
-        "Longitude DB",
-        "Exif Creation/Changed",
-        "Latitude",
-        "Longitude",
-        ("Exif", "html"),  # 明确这是 HTML，避免被转义
-        "Bundle Creator",
-    )
+            # 缩略图
+            thumb = _build_thumbnail(matched_path, zfilename, report_folder, files_found)
 
-    # context-wrapper 负责 HTML / TSV / Timeline 输出，这里只返回数据
-    return data_headers, data_list, source_file
+            # EXIF & 对比
+            (suspecttime, offset, suspectcoordinates,
+             creationchanged, latitude, longitude, exifdata) = _extract_exif_and_compare(
+                matched_path, zdatecreated, zlatitude, zlongitude
+            )
+
+            data_list.append(
+                (
+                    thumb,
+                    suspecttime,
+                    offset,
+                    suspectcoordinates,
+                    zdatecreated,
+                    zmodificationdate,
+                    zdirectory,
+                    zfilename,
+                    zlatitude,
+                    zlongitude,
+                    creationchanged,
+                    latitude,
+                    longitude,
+                    exifdata,
+                    zbundlecreator
+                )
+            )
+
+        if data_list:
+            description = (
+                'All times labeled as False require validation. Compare database times and '
+                'geolocation points to their EXIF counterparts. Timestamp value is in UTC. '
+                'Exif Creation/Change timestamp is on local time. Use Possible Exif Offset '
+                'column value to compare the times.'
+            )
+            report = ArtifactHtmlReport('Photos.sqlite Analysis')
+            report.start_artifact_report(report_folder, 'Photos.sqlite Analysis', description)
+            report.add_script()
+
+            # data_headers 可以在将来改成包含 media tuple：
+            # 例如：data_headers = (('Media', 'media'), 'Same Timestamps?', ...)
+            data_headers = (
+                'Media',
+                'Same Timestamps?',
+                'Possible Exif Offset',
+                'Same Coordinates?',
+                'Timestamp',
+                'Timestamp Modification',
+                'Directory',
+                'Filename',
+                'Latitude DB',
+                'Longitude DB',
+                'Exif Creation/Changed',
+                'Latitude',
+                'Longitude',
+                'Exif',
+                'Bundle Creator'
+            )
+
+            report.write_artifact_data_table(
+                data_headers,
+                data_list,
+                file_found,
+                html_no_escape=['Media', 'Exif']
+            )
+            report.end_artifact_report()
+
+            # TSV / Timeline 不支持 tuple 作为字段名，做一次安全展开
+            timeline_headers = tuple(
+                h[0] if isinstance(h, tuple) else h
+                for h in data_headers
+            )
+
+            tsvname = 'Photos.sqlite Analysis'
+            tsv(report_folder, timeline_headers, data_list, tsvname)
+
+            tlactivity = 'Photos.sqlite Analysis'
+            timeline(report_folder, tlactivity, data_list, timeline_headers)
+        else:
+            logfunc('No Photos.sqlite Analysis data available')
 
 
 __artifacts__ = {
     "photosDbexif": (
         "Photos",
-        ("*Media/PhotoData/Photos.sqlite*", "*Media/DCIM/*/**"),
-        get_photosDbexif,
+        ('*Media/PhotoData/Photos.sqlite*', '*Media/DCIM/*/**'),
+        get_photosDbexif
     )
 }
