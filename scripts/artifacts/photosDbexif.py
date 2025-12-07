@@ -1,5 +1,7 @@
+import json
 import os
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 import pytz
 from PIL import Image
 from pillow_heif import register_heif_opener
@@ -12,8 +14,10 @@ from scripts.ilapfuncs import (
     kmlgen,
     is_platform_windows,
     media_to_html,
-    open_sqlite_db_readonly
+    open_sqlite_db_readonly,
+    guess_mime
 )
+from scripts.photo_renderer import photo_HTML, render_photo_script
 
 
 def isclose(a, b, rel_tol=1e-06, abs_tol=0.0):
@@ -22,7 +26,7 @@ def isclose(a, b, rel_tol=1e-06, abs_tol=0.0):
 
 def get_exif(filename):
     """
-    只拿 GPS IFD（0x8825）。如果文件没有 EXIF/GPS，返回 None。
+    Only retrieve GPS IFD (0x8825). Return None if the file lacks EXIF/GPS.
     """
     try:
         with Image.open(filename) as img:
@@ -45,7 +49,7 @@ def get_exif(filename):
 
 def get_all_exif(filename):
     """
-    返回完整 EXIF dict，失败时返回空 dict，不再抛异常。
+    Return the full EXIF dict; on failure return an empty dict without raising.
     """
     try:
         with Image.open(filename) as img:
@@ -80,23 +84,23 @@ def get_geotagging(exif):
         try:
             geo_tagging_info[gps_keys[k]] = str(v)
         except IndexError:
-            # 忽略我们没列在 gps_keys 里的索引
+            # Ignore indexes that are not listed in gps_keys
             pass
     return geo_tagging_info
 
 
 def _get_asset_table_and_columns(db, db_path):
     """
-    运行时探测 Photos.sqlite 的主资产表（ZASSET 或 ZGENERICASSET），
-    并返回：
-      - asset_table: 实际使用的表名
-      - asset_cols: 该表的列名集合
-      - add_cols: ZADDITIONALASSETATTRIBUTES 的列名集合（如存在）
-      - has_additional: 是否存在 ZADDITIONALASSETATTRIBUTES
+    Detect at runtime the primary asset table in Photos.sqlite (ZASSET or ZGENERICASSET)
+    and return:
+      - asset_table: actual table name in use
+      - asset_cols: column names of that table
+      - add_cols: column names of ZADDITIONALASSETATTRIBUTES (if present)
+      - has_additional: whether ZADDITIONALASSETATTRIBUTES exists
     """
     cursor = db.cursor()
 
-    # 检查资产表
+    # Check asset tables
     cursor.execute("""
         SELECT name
         FROM sqlite_master
@@ -107,7 +111,7 @@ def _get_asset_table_and_columns(db, db_path):
         logfunc(f'Photos.sqlite: neither ZASSET nor ZGENERICASSET found in {db_path}')
         return None, set(), set(), False
 
-    # 如果两个都在，按名字排序（ZASSET 优先）
+    # If both exist, sort names (ZASSET first)
     asset_table = sorted({row[0] for row in table_rows})[0]
 
     def get_columns(table_name):
@@ -116,7 +120,7 @@ def _get_asset_table_and_columns(db, db_path):
 
     asset_cols = get_columns(asset_table)
 
-    # 额外属性表
+    # Additional attributes table
     cursor.execute("""
         SELECT name
         FROM sqlite_master
@@ -130,10 +134,10 @@ def _get_asset_table_and_columns(db, db_path):
 
 def _build_photos_query(asset_table, asset_cols, add_cols, has_additional):
     """
-    根据实际存在的列构造 SQL 语句，只引用真实存在的列。
-    返回 (sql, uses_lat_lon)：
-      - sql: 最终 SELECT 语句
-      - uses_lat_lon: 是否真正从库里读到了经纬度列
+    Build SQL using only columns that actually exist.
+    Returns (sql, uses_lat_lon):
+      - sql: final SELECT statement
+      - uses_lat_lon: whether latitude/longitude columns are truly read from the DB
     """
     select_cols = []
 
@@ -153,7 +157,7 @@ def _build_photos_query(asset_table, asset_cols, add_cols, has_additional):
     else:
         select_cols.append("NULL AS MODIFICATIONDATE")
 
-    # 路径信息
+    # Path fields
     if 'ZDIRECTORY' in asset_cols:
         select_cols.append(f"{asset_table}.ZDIRECTORY AS DIRECTORY")
     else:
@@ -166,7 +170,7 @@ def _build_photos_query(asset_table, asset_cols, add_cols, has_additional):
 
     uses_lat_lon = False
 
-    # 经纬度：优先资产表，其次附加属性表，否则用 NULL
+    # Coordinates: prefer asset table, then additional attributes table, else NULL
     if 'ZLATITUDE' in asset_cols and 'ZLONGITUDE' in asset_cols:
         select_cols.append(f"{asset_table}.ZLATITUDE AS LATITUDE")
         select_cols.append(f"{asset_table}.ZLONGITUDE AS LONGITUDE")
@@ -206,8 +210,8 @@ def _build_photos_query(asset_table, asset_cols, add_cols, has_additional):
 
 def _match_photo_files(files_found, zdirectory, zfilename):
     """
-    尝试在 files_found 里找到与 (zdirectory, zfilename) 对应的解密后实际文件路径。
-    返回第一个匹配到的路径字符串，找不到则返回 None。
+    Try to find the decrypted file path matching (zdirectory, zfilename) in files_found.
+    Return the first matched path string, or None if not found.
     """
     if not zdirectory or not zfilename:
         return None
@@ -228,7 +232,7 @@ def _match_photo_files(files_found, zdirectory, zfilename):
 
 def _build_thumbnail(search_path, zfilename, report_folder, files_found):
     """
-    根据文件类型构建缩略图 HTML。
+    Build thumbnail HTML based on file type.
     """
     thumb = ''
 
@@ -252,10 +256,77 @@ def _build_thumbnail(search_path, zfilename, report_folder, files_found):
     return thumb
 
 
+def _extract_media_paths(media_html: str):
+    if not media_html:
+        return "", ""
+    href_match = re.search(r'href="([^"]+)"', media_html)
+    img_match = re.search(r'src="([^"]+)"', media_html)
+    img_src = img_match.group(1) if img_match else ""
+    href_src = href_match.group(1) if href_match else ""
+    return img_src, href_src or img_src
+
+
+def _stringify_field(value):
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _encode_json_for_script_tag(data):
+    # Escape a closing </script> so injected data cannot break out of the JSON block
+    return json.dumps(data, ensure_ascii=False).replace('</', '<\\/')
+
+
+def _parse_datetime(value: str):
+    if not value:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    formats = (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y:%m:%d %H:%M:%S",
+        "%Y:%m:%d %H:%M:%S.%f",
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(value, fmt)
+        except (ValueError, TypeError):
+            continue
+    try:
+        return datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _apply_file_mtime(target_path: str, timestamp: datetime):
+    if not target_path or timestamp is None:
+        return
+    try:
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.astimezone(timezone.utc)
+        else:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        ts = timestamp.timestamp()
+        os.utime(target_path, (ts, ts))
+    except Exception as ex:
+        logfunc(f"Failed updating mtime for {target_path}: {ex}")
+
+
+def _update_file_mtime(matched_path: str, creationchanged: str, zdatecreated: str):
+    if not matched_path:
+        return
+    dt_exif = _parse_datetime(creationchanged)
+    dt_db = _parse_datetime(zdatecreated)
+    selected = dt_exif or dt_db
+    _apply_file_mtime(matched_path, selected)
+
+
 def _extract_exif_and_compare(search_path, zdatecreated, zlatitude, zlongitude):
     """
-    读取 EXIF / GPS，比较与 DB 经纬度 & 时间。
-    返回：
+    Read EXIF/GPS and compare with DB coordinates and timestamps.
+    Returns:
       suspecttime, offset, suspectcoordinates, creationchanged, latitude, longitude, exifdata
     """
     suspecttime = ''
@@ -266,7 +337,7 @@ def _extract_exif_and_compare(search_path, zdatecreated, zlatitude, zlongitude):
     longitude = ''
     exifdata = ''
 
-    # 只对常见图片格式尝试读 EXIF
+    # Only attempt EXIF for common image formats
     if not (search_path.upper().endswith('JPG') or
             search_path.upper().endswith('PNG') or
             search_path.upper().endswith('JPEG') or
@@ -277,7 +348,7 @@ def _extract_exif_and_compare(search_path, zdatecreated, zlatitude, zlongitude):
         image_info = get_exif(search_path)
         results = get_geotagging(image_info)
 
-        # 经纬度
+        # Coordinates
         if results is None:
             latitude = ''
             longitude = ''
@@ -319,7 +390,7 @@ def _extract_exif_and_compare(search_path, zdatecreated, zlatitude, zlongitude):
             else:
                 longitude = ''
 
-        # 全部 EXIF 文本
+        # All EXIF text
         exifall = get_all_exif(search_path)
         for x, y in exifall.items():
             if x == 271:
@@ -342,7 +413,7 @@ def _extract_exif_and_compare(search_path, zdatecreated, zlatitude, zlongitude):
             else:
                 exifdata += f'{x}: {y}<br>'
 
-        # 经纬度对比（只有 DB 里是 float 且 EXIF 里也有数值时才比较）
+        # Coordinate comparison (only when DB and EXIF both have float values)
         if isinstance(zlatitude, float) and isinstance(latitude, float):
             suspectA = isclose(zlatitude, latitude)
             if isinstance(zlongitude, float) and isinstance(longitude, float):
@@ -356,7 +427,7 @@ def _extract_exif_and_compare(search_path, zdatecreated, zlatitude, zlongitude):
         else:
             suspectcoordinates = ''
 
-        # 时间对比：DB 时间为 UTC，EXIF 通常是本地时间
+        # Time comparison: DB time is UTC, EXIF is usually local time
         if creationchanged and zdatecreated:
             mytz = pytz.timezone('UTC')
 
@@ -409,7 +480,7 @@ def get_photosDbexif(files_found, report_folder, seeker, wrap_text, timezone_off
 
         filename = os.path.basename(file_found)
         if not filename.lower().endswith('photos.sqlite'):
-            # 只关心 Photos.sqlite
+            # Only process Photos.sqlite
             continue
 
         data_list = []
@@ -439,7 +510,8 @@ def get_photosDbexif(files_found, report_folder, seeker, wrap_text, timezone_off
             logfunc('No Photos.sqlite Analysis data available')
             continue
 
-        # 处理每一条 DB 记录
+        matched_paths = []
+        # Process each DB record
         for row in all_rows:
             (thumb, suspecttime, suspectcoordinates,
              zdatecreated, zmodificationdate, zdirectory, zfilename,
@@ -457,20 +529,22 @@ def get_photosDbexif(files_found, report_folder, seeker, wrap_text, timezone_off
             zlongitude = row[5]
             zbundlecreator = row[6]
 
-            # 找对应文件
+            # Find matching file
             matched_path = _match_photo_files(files_found, zdirectory, zfilename)
             if not matched_path:
                 continue
 
-            # 缩略图
+            # Thumbnail
             thumb = _build_thumbnail(matched_path, zfilename, report_folder, files_found)
 
-            # EXIF & 对比
+            # EXIF and comparisons
             (suspecttime, offset, suspectcoordinates,
              creationchanged, latitude, longitude, exifdata) = _extract_exif_and_compare(
                 matched_path, zdatecreated, zlatitude, zlongitude
             )
 
+            _update_file_mtime(matched_path, creationchanged, zdatecreated)
+            matched_paths.append(matched_path)
             data_list.append(
                 (
                     thumb,
@@ -500,10 +574,25 @@ def get_photosDbexif(files_found, report_folder, seeker, wrap_text, timezone_off
             )
             report = ArtifactHtmlReport('Photos.sqlite Analysis')
             report.start_artifact_report(report_folder, 'Photos.sqlite Analysis', description)
-            report.add_script()
 
-            # data_headers 可以在将来改成包含 media tuple：
-            # 例如：data_headers = (('Media', 'media'), 'Same Timestamps?', ...)
+            rows_json = []
+            for index, entry in enumerate(data_list):
+                thumb_html, *fields = entry
+                thumb_src, preview_src = _extract_media_paths(thumb_html)
+                rows_json.append({
+                    "thumb": thumb_src,
+                    "preview": preview_src or thumb_src,
+                    "mediaType": guess_mime(matched_paths[index]) or "",
+                    "fields": [_stringify_field(value) for value in fields]
+                })
+
+            data_json = _encode_json_for_script_tag(rows_json)
+            report.write_lead_text(f'Total number of entries: {len(data_list)}')
+            report.write_lead_text(f'Photos.sqlite Analysis located at: {file_found}')
+            report.write_raw_html(photo_HTML.replace("__DATA_JSON__", data_json))
+            report.add_script(render_photo_script())
+            report.end_artifact_report()
+
             data_headers = (
                 'Media',
                 'Same Timestamps?',
@@ -522,15 +611,7 @@ def get_photosDbexif(files_found, report_folder, seeker, wrap_text, timezone_off
                 'Bundle Creator'
             )
 
-            report.write_artifact_data_table(
-                data_headers,
-                data_list,
-                file_found,
-                html_no_escape=['Media', 'Exif']
-            )
-            report.end_artifact_report()
-
-            # TSV / Timeline 不支持 tuple 作为字段名，做一次安全展开
+            # TSV / Timeline do not support tuple headers; flatten safely
             timeline_headers = tuple(
                 h[0] if isinstance(h, tuple) else h
                 for h in data_headers
